@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import uuid
-import random
+import shutil
 
 LOGGER = logging.getLogger(__name__)
 
@@ -60,63 +60,31 @@ class SmartMegaLeecher:
         os.makedirs(session_dir, exist_ok=True)
         return session_dir
 
-    def _resolve_output(self, session_dir, file_path=None):
-        # If specific file path was detected and exists
-        if file_path and os.path.exists(file_path):
-            return [file_path]
-
-        # Otherwise scan directory
+    def _resolve_output(self, session_dir):
+        # Recursively find all files in the session directory
         files = []
         for root, _, filenames in os.walk(session_dir):
             for filename in filenames:
                 files.append(os.path.join(root, filename))
+        
+        # Sort files to ensure they upload in order (1.mp4, 2.mp4, etc.)
         return sorted(files)
-
-    async def get_downloading_file_path(self, mega_link):
-        # Try to get info directly first
-        cmd = ["megadl", "--info", mega_link]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            LOGGER.warning(f"Failed to fetch mega info (Direct): {err}")
-            return None
-        
-        try:
-            output = stdout.decode().strip()
-            for line in output.split('\n'):
-                if line.startswith("filename:"):
-                    filename = line.split("filename:", 1)[1].strip()
-                    return os.path.join(self.download_path, filename)
-        except Exception as e:
-            LOGGER.error(f"Error parsing mega info: {e}")
-        return None
 
     async def download(self, mega_link, update_status_func=None):
         session_dir = self._create_session_dir()
         baseline_size = self._get_dir_size(session_dir)
         
-        # Try to get filename info
-        file_path = await self.get_downloading_file_path(mega_link)
-        if not file_path:
-            LOGGER.info("Proceeding without pre-fetched filename.")
-        else:
-            # Adjust path to be inside session dir for safety/isolation
-            file_path = os.path.join(session_dir, os.path.basename(file_path))
-
-        LOGGER.info(f"Starting Smart Download for: {mega_link}")
+        LOGGER.info(f"Starting Folder Download for: {mega_link}")
 
         # Attempt download loop
         retry_count = 0
-        max_retries = len(self.proxies) * 2 # Try cycling through list twice
+        max_retries = len(self.proxies) * 2 
 
         while not self.is_cancelled:
             current_proxy = self.get_next_proxy()
             proxy_label = current_proxy if current_proxy else "Direct (No Proxy)"
             
+            # megadl will download the full folder structure into session_dir
             cmd = ["megadl", "--path", session_dir, mega_link]
             if current_proxy:
                 cmd.extend(["--proxy", current_proxy])
@@ -130,7 +98,6 @@ class SmartMegaLeecher:
             )
 
             limit_reached = False
-            start_time = time.time()
             
             while True:
                 if self.is_cancelled:
@@ -141,18 +108,15 @@ class SmartMegaLeecher:
                 if process.returncode is not None:
                     break
 
-                # Calculate size
-                if file_path and os.path.exists(file_path):
-                    current_size = os.path.getsize(file_path)
-                else:
-                    current_size = self._get_dir_size(session_dir) - baseline_size
+                # Calculate total size of the folder being downloaded
+                current_size = self._get_dir_size(session_dir) - baseline_size
                     
                 if update_status_func:
                     await update_status_func(
-                        f"Downloading... {current_size / (1024*1024):.2f} MB\nUsing: {proxy_label}"
+                        f"Downloading Folder...\nSize: {current_size / (1024*1024):.2f} MB\nUsing: {proxy_label}"
                     )
 
-                # Check Mega Bandwidth Limit (approximate)
+                # Check Mega Bandwidth Limit
                 if current_size >= self.limit_bytes:
                     LOGGER.info("Bandwidth limit hit. Switching connection...")
                     try: process.kill()
@@ -167,11 +131,11 @@ class SmartMegaLeecher:
             
             # Check result
             if process.returncode == 0 and not limit_reached:
-                output_files = self._resolve_output(session_dir, file_path)
+                output_files = self._resolve_output(session_dir)
                 if output_files:
                     return True, output_files
                 else:
-                    return False, "Download finished but file not found (folder empty?)."
+                    return False, "Download finished but folder is empty."
             
             # Handle resume or failure
             if limit_reached:
@@ -179,7 +143,7 @@ class SmartMegaLeecher:
                 await asyncio.sleep(1)
                 continue
             
-            # If we are here, the process failed (non-zero exit)
+            # If we are here, the process failed
             _, stderr = await process.communicate()
             error_message = stderr.decode().strip() if stderr else "Unknown error"
             
