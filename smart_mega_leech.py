@@ -3,6 +3,7 @@ import os
 import time
 import logging
 import uuid
+import random
 
 LOGGER = logging.getLogger(__name__)
 
@@ -16,19 +17,24 @@ class SmartMegaLeecher:
         self.is_cancelled = False
 
     def _load_proxies(self, filepath):
-        if not os.path.exists(filepath):
-            LOGGER.warning(f"Proxy file {filepath} not found!")
-            return []
-        with open(filepath, 'r') as f:
-            proxies = []
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    if "://" not in line:
-                        proxies.append(f"http://{line}")
-                    else:
-                        proxies.append(line)
-            return proxies
+        proxies = []
+        # Always add 'None' first to ensure we try Direct connection
+        proxies.append(None)
+        
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        if "://" not in line:
+                            proxies.append(f"http://{line}")
+                        else:
+                            proxies.append(line)
+            LOGGER.info(f"Loaded {len(proxies)-1} proxies. (Direct connection included)")
+        else:
+            LOGGER.info("No proxies file found. Using Direct connection only.")
+            
+        return proxies
 
     def get_next_proxy(self):
         if not self.proxies:
@@ -55,9 +61,11 @@ class SmartMegaLeecher:
         return session_dir
 
     def _resolve_output(self, session_dir, file_path=None):
+        # If specific file path was detected and exists
         if file_path and os.path.exists(file_path):
             return [file_path]
 
+        # Otherwise scan directory
         files = []
         for root, _, filenames in os.walk(session_dir):
             for filename in filenames:
@@ -65,12 +73,16 @@ class SmartMegaLeecher:
         return sorted(files)
 
     async def get_downloading_file_path(self, mega_link):
+        # Try to get info directly first
         cmd = ["megadl", "--info", mega_link]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
+        
         if proc.returncode != 0:
+            err = stderr.decode().strip()
+            LOGGER.warning(f"Failed to fetch mega info (Direct): {err}")
             return None
         
         try:
@@ -79,28 +91,37 @@ class SmartMegaLeecher:
                 if line.startswith("filename:"):
                     filename = line.split("filename:", 1)[1].strip()
                     return os.path.join(self.download_path, filename)
-        except:
-            pass
+        except Exception as e:
+            LOGGER.error(f"Error parsing mega info: {e}")
         return None
 
     async def download(self, mega_link, update_status_func=None):
         session_dir = self._create_session_dir()
         baseline_size = self._get_dir_size(session_dir)
+        
+        # Try to get filename info
         file_path = await self.get_downloading_file_path(mega_link)
         if not file_path:
-            LOGGER.warning("Could not fetch file info from Mega. Proceeding without filename.")
+            LOGGER.info("Proceeding without pre-fetched filename.")
         else:
+            # Adjust path to be inside session dir for safety/isolation
             file_path = os.path.join(session_dir, os.path.basename(file_path))
 
         LOGGER.info(f"Starting Smart Download for: {mega_link}")
 
+        # Attempt download loop
+        retry_count = 0
+        max_retries = len(self.proxies) * 2 # Try cycling through list twice
+
         while not self.is_cancelled:
             current_proxy = self.get_next_proxy()
+            proxy_label = current_proxy if current_proxy else "Direct (No Proxy)"
             
             cmd = ["megadl", "--path", session_dir, mega_link]
             if current_proxy:
                 cmd.extend(["--proxy", current_proxy])
-                LOGGER.info(f"Using Proxy: {current_proxy}")
+            
+            LOGGER.info(f"Attempting download via: {proxy_label}")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -109,28 +130,33 @@ class SmartMegaLeecher:
             )
 
             limit_reached = False
+            start_time = time.time()
+            
             while True:
                 if self.is_cancelled:
-                    process.kill()
+                    try: process.kill()
+                    except: pass
                     return False, "Cancelled"
 
                 if process.returncode is not None:
                     break
 
+                # Calculate size
                 if file_path and os.path.exists(file_path):
-                    size = os.path.getsize(file_path)
+                    current_size = os.path.getsize(file_path)
                 else:
-                    size = self._get_dir_size(session_dir) - baseline_size
+                    current_size = self._get_dir_size(session_dir) - baseline_size
                     
                 if update_status_func:
-                    proxy_label = current_proxy or "direct"
                     await update_status_func(
-                        f"Downloading... {size / (1024*1024):.2f} MB\nProxy: {proxy_label}"
+                        f"Downloading... {current_size / (1024*1024):.2f} MB\nUsing: {proxy_label}"
                     )
 
-                if size >= self.limit_bytes:
-                    LOGGER.info("1.9GB Limit hit. Switching Proxy...")
-                    process.kill()
+                # Check Mega Bandwidth Limit (approximate)
+                if current_size >= self.limit_bytes:
+                    LOGGER.info("Bandwidth limit hit. Switching connection...")
+                    try: process.kill()
+                    except: pass
                     limit_reached = True
                     break
                 
@@ -139,23 +165,30 @@ class SmartMegaLeecher:
                 except asyncio.TimeoutError:
                     pass
             
+            # Check result
             if process.returncode == 0 and not limit_reached:
                 output_files = self._resolve_output(session_dir, file_path)
-                if not output_files:
-                    return False, "Download finished but no files were found."
-                return True, output_files
+                if output_files:
+                    return True, output_files
+                else:
+                    return False, "Download finished but file not found (folder empty?)."
             
+            # Handle resume or failure
             if limit_reached:
-                LOGGER.info("Resuming with new proxy...")
+                LOGGER.info("Resuming with next proxy...")
                 await asyncio.sleep(1)
                 continue
             
+            # If we are here, the process failed (non-zero exit)
             _, stderr = await process.communicate()
             error_message = stderr.decode().strip() if stderr else "Unknown error"
-            if "Can't open folder" in error_message or "CURL error" in error_message:
-                LOGGER.warning(f"Download failed with proxy, switching... {error_message}")
-                await asyncio.sleep(1)
-                continue
-            return False, f"Download failed: {error_message}"
+            
+            LOGGER.warning(f"Failed with {proxy_label}: {error_message}")
+            
+            retry_count += 1
+            if retry_count > max_retries:
+                 return False, f"All proxies failed. Last error: {error_message}"
+            
+            await asyncio.sleep(1)
         
         return False, "Unknown Error"
