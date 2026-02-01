@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import shutil
 import time
 from aiohttp import web
 from pyrogram import Client, filters
@@ -58,12 +59,18 @@ async def leech_handler(client, message):
     if success:
         await msg.edit("Download Complete! Uploading...")
         try:
-            await app.send_document(
-                chat_id=message.chat.id,
-                document=result,
-                caption="Here is your file."
-            )
-            os.remove(result)
+            files_to_send = result if isinstance(result, list) else [result]
+            for file_path in files_to_send:
+                await app.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    caption="Here is your file."
+                )
+                os.remove(file_path)
+            if isinstance(result, list) and result:
+                session_dir = os.path.dirname(os.path.commonpath(result))
+                if os.path.basename(session_dir).startswith("job_"):
+                    shutil.rmtree(session_dir, ignore_errors=True)
             await msg.delete()
         except Exception as e:
             await msg.edit(f"Upload failed: {e}")
