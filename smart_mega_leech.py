@@ -11,66 +11,71 @@ LOGGER = logging.getLogger(__name__)
 
 class ProxyManager:
     def __init__(self, proxies, limit_bytes=1.8 * 1024**3):
-        self.proxies = proxies  # List of proxy strings (including None for Direct)
+        self.proxies = proxies
         self.limit_bytes = limit_bytes
         self.mongo_url = os.environ.get("MONGO_URL")
         self.collection = None
         if self.mongo_url:
             try:
                 client = AsyncIOMotorClient(self.mongo_url)
-                self.collection = client.mega_leech_v2.proxy_usage
+                # Using a specific database and collection
+                self.collection = client["mega_leech_v2"]["proxy_usage"]
                 LOGGER.info("Connected to MongoDB for Proxy Tracking.")
             except Exception as e:
                 LOGGER.error(f"Failed to connect to MongoDB: {e}")
 
     async def get_best_proxy(self):
-        # If no DB, just rotate simply (fallback)
-        if not self.collection:
+        # FIX: Check explicitly against None
+        if self.collection is None:
             if not self.proxies: return None
-            # Simple round-robin or random could go here, but we default to first available
             return self.proxies[0] 
 
         now = datetime.utcnow()
         
-        # Check all proxies to find one that is available
         for proxy in self.proxies:
             proxy_key = proxy if proxy else "DIRECT"
             
-            doc = await self.collection.find_one({"_id": proxy_key})
+            try:
+                doc = await self.collection.find_one({"_id": proxy_key})
+            except Exception as e:
+                LOGGER.error(f"DB Error: {e}")
+                return proxy # Fallback if DB fails
             
             if not doc:
-                return proxy # Fresh proxy, never used
+                return proxy 
             
             last_updated = doc.get("last_updated", datetime.min)
             used_bytes = doc.get("used_bytes", 0)
             
-            # Check if 12 hours have passed
+            # Reset after 12 hours
             if (now - last_updated) > timedelta(hours=12):
-                # Reset usage in DB
                 await self.collection.update_one(
                     {"_id": proxy_key},
                     {"$set": {"used_bytes": 0, "last_updated": now}}
                 )
                 return proxy
             
-            # Check bandwidth limit
             if used_bytes < self.limit_bytes:
                 return proxy
             
-        return None # No proxies available
+        return None
 
     async def update_usage(self, proxy, bytes_downloaded):
-        if not self.collection: return
+        # FIX: Check explicitly against None
+        if self.collection is None: return
         
         proxy_key = proxy if proxy else "DIRECT"
-        await self.collection.update_one(
-            {"_id": proxy_key},
-            {
-                "$inc": {"used_bytes": bytes_downloaded},
-                "$set": {"last_updated": datetime.utcnow()}
-            },
-            upsert=True
-        )
+        try:
+            await self.collection.update_one(
+                {"_id": proxy_key},
+                {
+                    "$inc": {"used_bytes": bytes_downloaded},
+                    "$set": {"last_updated": datetime.utcnow()}
+                },
+                upsert=True
+            )
+        except Exception as e:
+            LOGGER.error(f"Failed to update usage stats: {e}")
 
 class SmartMegaLeecher:
     def __init__(self, download_path, proxies_file="proxies.txt"):
@@ -80,7 +85,7 @@ class SmartMegaLeecher:
         self.is_cancelled = False
 
     def _load_proxies(self, filepath):
-        proxies = [None] # Start with Direct
+        proxies = [None] # Direct connection first
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
                 for line in f:
@@ -110,51 +115,63 @@ class SmartMegaLeecher:
         return session_dir
 
     async def _get_mega_file_order(self, mega_link):
-        """Runs megadl --info to get the exact order of files in the folder."""
+        """
+        Runs megadl --info to get the full list of files.
+        It parses the output to get the relative path structure (Folder/Sub/File.mp4).
+        """
         cmd = ["megadl", "--info", mega_link]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
+        # Allow time for info gathering on large folders (1TB+)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch mega info: {e}")
+            return []
         
-        ordered_names = []
+        ordered_paths = []
         if proc.returncode == 0:
             try:
-                output = stdout.decode().strip()
+                output = stdout.decode("utf-8", errors="ignore").strip()
                 for line in output.split('\n'):
-                    # Output format usually: filename: /Root/Folder/file.mp4
                     if line.strip().startswith("filename:"):
-                        full_path = line.split("filename:", 1)[1].strip()
-                        # We only care about the filename to match with disk
-                        filename = os.path.basename(full_path)
-                        ordered_names.append(filename)
+                        # Extract: /RootFolder/SubFolder/File.mp4
+                        # remove leading "filename: " and then strip leading slashes
+                        raw_path = line.split("filename:", 1)[1].strip().lstrip("/")
+                        ordered_paths.append(raw_path)
             except Exception as e:
                 LOGGER.error(f"Error parsing order: {e}")
-        return ordered_names
+        return ordered_paths
 
-    def _resolve_output_ordered(self, session_dir, ordered_names):
-        """Matches downloaded files on disk to the original Mega order."""
+    def _resolve_output_ordered(self, session_dir, ordered_paths):
+        """
+        Matches files on disk to the Mega folder structure.
+        """
         found_files_map = {}
         extra_files = []
 
-        # Scan directory
+        # 1. Map all files currently on disk by their RELATIVE path
+        #    Example: session_dir/MyFolder/Video.mp4 -> Key: MyFolder/Video.mp4
         for root, _, filenames in os.walk(session_dir):
             for filename in filenames:
                 full_path = os.path.join(root, filename)
-                found_files_map[filename] = full_path
+                # Get path relative to the download session root
+                rel_path = os.path.relpath(full_path, session_dir)
+                found_files_map[rel_path] = full_path
                 extra_files.append(full_path)
 
         final_list = []
         
-        # 1. Add files in the order Mega listed them
-        for name in ordered_names:
-            if name in found_files_map:
-                final_list.append(found_files_map[name])
-                # Remove from map so we don't add it again
-                if found_files_map[name] in extra_files:
-                    extra_files.remove(found_files_map[name])
+        # 2. Reconstruct list based on Mega's order
+        for mega_path in ordered_paths:
+            # We try to find the exact path match
+            if mega_path in found_files_map:
+                final_list.append(found_files_map[mega_path])
+                if found_files_map[mega_path] in extra_files:
+                    extra_files.remove(found_files_map[mega_path])
         
-        # 2. Add any remaining files (alphabetically) that weren't in the info list for some reason
+        # 3. If any files were downloaded but not in the info list, add them at the end
         if extra_files:
             final_list.extend(sorted(extra_files))
             
@@ -164,18 +181,20 @@ class SmartMegaLeecher:
         session_dir = self._create_session_dir()
         baseline_size = self._get_dir_size(session_dir)
         
-        LOGGER.info(f"Fetching file order for: {mega_link}")
+        if update_status_func:
+            await update_status_func("Fetching folder structure... (This may take time for large folders)")
+
         ordered_filenames = await self._get_mega_file_order(mega_link)
+        LOGGER.info(f"Found {len(ordered_filenames)} files in Mega structure.")
         
         retry_count = 0
-        max_retries = 10 # Prevent infinite loops
+        max_retries = 15
 
         while not self.is_cancelled:
-            # Get a valid proxy from DB
             current_proxy = await self.proxy_manager.get_best_proxy()
             
             if current_proxy is None and retry_count > 0:
-                return False, "All proxies (and Direct) are exhausted/limited."
+                return False, "All proxies (and Direct) are exhausted/limited for now."
 
             proxy_label = current_proxy if current_proxy else "Direct"
             
@@ -204,11 +223,10 @@ class SmartMegaLeecher:
                 if process.returncode is not None:
                     break
 
-                # Calculate size delta
                 total_current_size = self._get_dir_size(session_dir)
                 downloaded_so_far = total_current_size - baseline_size
                 
-                # Update DB every 5 seconds or if size changed significantly
+                # Update DB Usage
                 if time.time() - last_db_update > 5:
                     delta = downloaded_so_far - current_download_usage
                     if delta > 0:
@@ -217,12 +235,12 @@ class SmartMegaLeecher:
                         last_db_update = time.time()
 
                 if update_status_func:
-                    await update_status_func(
-                        f"Downloading...\nSize: {downloaded_so_far / (1024**2):.2f} MB\nProxy: {proxy_label}"
-                    )
+                    msg = f"Downloading Folder...\nSize: {downloaded_so_far / (1024**2):.2f} MB\nProxy: {proxy_label}"
+                    if len(ordered_filenames) > 0:
+                        msg += f"\nTotal Files: {len(ordered_filenames)}"
+                    await update_status_func(msg)
 
-                # Check if this specific session is getting too huge for one proxy
-                # (Optional: You can rely purely on the initial check, but strict enforcement is here)
+                # Safety Check: If one proxy downloads > 1.9GB, kill it to rotate
                 if downloaded_so_far > (1.9 * 1024**3): 
                      LOGGER.info("Session exceeded safe limit for this proxy. Switching...")
                      try: process.kill()
@@ -235,21 +253,21 @@ class SmartMegaLeecher:
                 except asyncio.TimeoutError:
                     pass
             
-            # Final DB update for this run
+            # Final DB update
             total_current_size = self._get_dir_size(session_dir)
             final_delta = (total_current_size - baseline_size) - current_download_usage
             if final_delta > 0:
                 await self.proxy_manager.update_usage(current_proxy, final_delta)
 
+            # Success Check
             if process.returncode == 0 and not limit_reached:
                 output_files = self._resolve_output_ordered(session_dir, ordered_filenames)
                 if output_files:
                     return True, output_files
                 return False, "Download finished but folder is empty."
             
+            # Failure/Limit Handling
             if limit_reached or process.returncode != 0:
-                # If failed or limited, force update DB to ensure this proxy is marked as used
-                # Then loop again to pick a NEW proxy (get_best_proxy will skip the full one)
                 LOGGER.info("Switching proxy and resuming...")
                 retry_count += 1
                 await asyncio.sleep(2)
