@@ -2,7 +2,6 @@ import asyncio
 import os
 import time
 import logging
-import shutil
 import uuid
 
 LOGGER = logging.getLogger(__name__)
@@ -57,15 +56,13 @@ class SmartMegaLeecher:
 
     def _resolve_output(self, session_dir, file_path=None):
         if file_path and os.path.exists(file_path):
-            return file_path
+            return [file_path]
 
-        entries = os.listdir(session_dir)
-        if len(entries) == 1:
-            entry_path = os.path.join(session_dir, entries[0])
-            if os.path.isfile(entry_path):
-                return entry_path
-        archive_path = shutil.make_archive(session_dir, "zip", session_dir)
-        return archive_path
+        files = []
+        for root, _, filenames in os.walk(session_dir):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+        return sorted(files)
 
     async def get_downloading_file_path(self, mega_link):
         cmd = ["megadl", "--info", mega_link]
@@ -143,8 +140,10 @@ class SmartMegaLeecher:
                     pass
             
             if process.returncode == 0 and not limit_reached:
-                output_path = self._resolve_output(session_dir, file_path)
-                return True, output_path
+                output_files = self._resolve_output(session_dir, file_path)
+                if not output_files:
+                    return False, "Download finished but no files were found."
+                return True, output_files
             
             if limit_reached:
                 LOGGER.info("Resuming with new proxy...")
@@ -153,6 +152,10 @@ class SmartMegaLeecher:
             
             _, stderr = await process.communicate()
             error_message = stderr.decode().strip() if stderr else "Unknown error"
+            if "Can't open folder" in error_message or "CURL error" in error_message:
+                LOGGER.warning(f"Download failed with proxy, switching... {error_message}")
+                await asyncio.sleep(1)
+                continue
             return False, f"Download failed: {error_message}"
         
         return False, "Unknown Error"
