@@ -1,9 +1,11 @@
 FROM python:3.10-slim-bookworm
 
-# Install megatools and system dependencies
+# Install megatools, git, and ca-certificates (crucial for valid HTTPS/CURL connections)
 RUN apt-get update && apt-get install -y \
     megatools \
     git \
+    ca-certificates \
+    iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
