@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import logging
+import shutil
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,15 @@ class SmartMegaLeecher:
         proxy = self.proxies[self.current_proxy_index]
         self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxies)
         return proxy
+    
+    def _get_dir_size(self, path):
+        total_size = 0
+        for root, _, files in os.walk(path):
+            for filename in files:
+                filepath = os.path.join(root, filename)
+                if not os.path.islink(filepath):
+                    total_size += os.path.getsize(filepath)
+        return total_size
 
     async def get_downloading_file_path(self, mega_link):
         cmd = ["megadl", "--info", mega_link]
@@ -59,10 +69,11 @@ class SmartMegaLeecher:
         if not os.path.exists(self.download_path):
             os.makedirs(self.download_path)
 
+        existing_entries = set(os.listdir(self.download_path))
+        baseline_size = self._get_dir_size(self.download_path)
         file_path = await self.get_downloading_file_path(mega_link)
         if not file_path:
-            LOGGER.error("Could not fetch file info from Mega.")
-            return False, "Invalid Link"
+            LOGGER.warning("Could not fetch file info from Mega. Proceeding without filename.")
 
         LOGGER.info(f"Starting Smart Download for: {mega_link}")
 
@@ -89,17 +100,20 @@ class SmartMegaLeecher:
                 if process.returncode is not None:
                     break
 
-                if os.path.exists(file_path):
+                size = None
+                if file_path and os.path.exists(file_path):
                     size = os.path.getsize(file_path)
+                else:
+                    size = self._get_dir_size(self.download_path) - baseline_size
                     
-                    if update_status_func:
-                        await update_status_func(f"Downloading... {size / (1024*1024):.2f} MB\nProxy: {current_proxy}")
+                if update_status_func:
+                    await update_status_func(f"Downloading... {size / (1024*1024):.2f} MB\nProxy: {current_proxy}")
 
-                    if size >= self.limit_bytes:
-                        LOGGER.info("1.8GB Limit hit. Switching Proxy...")
-                        process.kill()
-                        limit_reached = True
-                        break
+                if size >= self.limit_bytes:
+                    LOGGER.info("1.8GB Limit hit. Switching Proxy...")
+                    process.kill()
+                    limit_reached = True
+                    break
                 
                 try:
                     await asyncio.wait_for(process.wait(), timeout=2)
@@ -107,7 +121,17 @@ class SmartMegaLeecher:
                     pass
             
             if process.returncode == 0 and not limit_reached:
-                return True, file_path
+                new_entries = [entry for entry in os.listdir(self.download_path) if entry not in existing_entries]
+                if len(new_entries) == 1:
+                    entry_path = os.path.join(self.download_path, new_entries[0])
+                    if os.path.isdir(entry_path):
+                        archive_base = os.path.join(self.download_path, new_entries[0])
+                        archive_path = shutil.make_archive(archive_base, "zip", entry_path)
+                        return True, archive_path
+                    return True, entry_path
+                if file_path and os.path.exists(file_path):
+                    return True, file_path
+                return False, "Download finished but output could not be determined."
             
             if limit_reached or process.returncode != 0:
                 LOGGER.info("Resuming with new proxy...")
